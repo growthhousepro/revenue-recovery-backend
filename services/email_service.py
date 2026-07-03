@@ -1,141 +1,203 @@
 import os
-from resend import Resend
-from models import EmailLog, EmailStatus, Campaign, Lead
+import requests
 from sqlalchemy.orm import Session
+from models import Campaign, Lead, EmailLog, EmailStatus, User
 from datetime import datetime
 import uuid
 
-FROM_EMAIL = os.getenv("FROM_EMAIL", "sales@gogrowthhouse.com")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+DEFAULT_FROM_EMAIL = os.getenv("FROM_EMAIL", "sales@gogrowthhouse.com")
 
-def get_resend_client():
-    api_key = os.getenv("RESEND_API_KEY")
-    if not api_key:
-        raise ValueError("RESEND_API_KEY not set in environment")
-    return Resend(api_key=api_key)
+def convert_text_to_html(text: str) -> str:
+    """Convert plain text to HTML, preserving line breaks and spacing"""
+    if '<' in text and '>' in text:
+        # Already HTML
+        return text
+    
+    # Split by newlines
+    lines = text.split('\n')
+    html_parts = []
+    current_paragraph = []
+    blank_line_count = 0
+    
+    for line in lines:
+        if line.strip():
+            # Non-empty line
+            blank_line_count = 0
+            current_paragraph.append(line.strip())
+        else:
+            # Empty line
+            blank_line_count += 1
+            if blank_line_count == 1 and current_paragraph:
+                # First blank line ends paragraph
+                para_text = '<br>'.join(current_paragraph)
+                html_parts.append(f'<p>{para_text}</p>')
+                current_paragraph = []
+            elif blank_line_count > 1:
+                # Additional blank lines become spacing
+                html_parts.append('<p>&nbsp;</p>')
+    
+    # Don't forget the last paragraph
+    if current_paragraph:
+        para_text = '<br>'.join(current_paragraph)
+        html_parts.append(f'<p>{para_text}</p>')
+    
+    return ''.join(html_parts) if html_parts else '<p>No content</p>'
 
-def send_campaign_emails(campaign_id: str, db: Session):
-    """Send emails to all leads in a campaign"""
+def send_campaign_emails(campaign_id: str, user_id: str, db: Session):
+    """Send emails for a campaign to all leads"""
     
-    campaign = db.query(Campaign).filter(Campaign.id == campaign_id).first()
-    if not campaign:
-        return {"error": "Campaign not found"}
+    print(f"=== SEND EMAILS START ===")
+    print(f"Campaign ID: {campaign_id}")
+    print(f"User ID: {user_id}")
+    print(f"RESEND_API_KEY set: {bool(RESEND_API_KEY)}")
     
-    leads = db.query(Lead).filter(Lead.campaign_id == campaign_id).all()
-    
-    sent_count = 0
-    failed_count = 0
-    
-    resend_client = get_resend_client()
-    
-    for lead in leads:
-        try:
-            # Personalize email
-            email_body = campaign.email_template.replace("{first_name}", lead.first_name)
-            email_body = email_body.replace("{last_name}", lead.last_name)
-            email_body = email_body.replace("{company}", lead.company or "")
-            
-            # Send via Resend
-            email = resend_client.emails.send({
-                "from": FROM_EMAIL,
-                "to": lead.email,
-                "subject": campaign.subject_line,
-                "html": email_body,
-                "reply_to": FROM_EMAIL
-            })
-            
-            # Log the email
-            email_log_id = str(uuid.uuid4())
-            email_log = EmailLog(
-                id=email_log_id,
-                campaign_id=campaign_id,
-                lead_id=lead.id,
-                recipient_email=lead.email,
-                subject=campaign.subject_line,
-                body=email_body,
-                status=EmailStatus.SENT,
-                sent_at=datetime.utcnow(),
-                resend_email_id=email.get("id") if isinstance(email, dict) else str(email)
-            )
-            
-            db.add(email_log)
-            
-            # Update lead status
-            lead.status = "sent"
-            
-            sent_count += 1
-            
-        except Exception as e:
-            print(f"Failed to send email to {lead.email}: {str(e)}")
-            failed_count += 1
-            
-            # Log failed attempt
-            email_log_id = str(uuid.uuid4())
-            email_log = EmailLog(
-                id=email_log_id,
-                campaign_id=campaign_id,
-                lead_id=lead.id,
-                recipient_email=lead.email,
-                subject=campaign.subject_line,
-                body="",
-                status=EmailStatus.FAILED
-            )
-            db.add(email_log)
-    
-    # Update campaign stats
-    campaign.emails_sent = sent_count
-    
-    db.commit()
-    
-    return {
-        "campaign_id": campaign_id,
-        "sent": sent_count,
-        "failed": failed_count,
-        "total": len(leads)
-    }
-
-def handle_reply(resend_event: dict, db: Session):
-    """Handle incoming email replies via webhook"""
+    if not RESEND_API_KEY:
+        print("ERROR: Resend API key not configured")
+        return {"error": "Resend API key not configured", "sent": 0, "total": 0}
     
     try:
-        event_type = resend_event.get("type")
-        email_id = resend_event.get("email_id")
+        # Get user to find their sender email
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            print(f"ERROR: User {user_id} not found")
+            return {"error": "User not found", "sent": 0, "total": 0}
         
-        # Find the email log
-        email_log = db.query(EmailLog).filter(EmailLog.resend_email_id == email_id).first()
-        if not email_log:
-            return {"status": "email_not_found"}
+        # Use user's sender email or default
+        from_email = user.sender_email if user.sender_email else DEFAULT_FROM_EMAIL
+        print(f"FROM_EMAIL: {from_email}")
         
-        if event_type == "email.delivered":
-            email_log.status = EmailStatus.SENT
-            
-        elif event_type == "email.opened":
-            email_log.status = EmailStatus.OPENED
-            email_log.opened_at = datetime.utcnow()
-            email_log.open_count += 1
-            
-            # Update campaign opens
-            campaign = db.query(Campaign).filter(Campaign.id == email_log.campaign_id).first()
-            if campaign:
-                campaign.opens += 1
+        campaign = db.query(Campaign).filter(Campaign.id == campaign_id).first()
+        if not campaign:
+            print(f"ERROR: Campaign {campaign_id} not found")
+            return {"error": "Campaign not found", "sent": 0, "total": 0}
         
-        elif event_type == "email.clicked":
-            email_log.click_count += 1
+        print(f"Campaign found: {campaign.name}")
         
-        elif event_type == "email.replied":
-            email_log.status = EmailStatus.REPLIED
-            email_log.replied_at = datetime.utcnow()
-            
-            # Update campaign replies
-            campaign = db.query(Campaign).filter(Campaign.id == email_log.campaign_id).first()
-            if campaign:
-                campaign.replies_received += 1
+        leads = db.query(Lead).filter(Lead.campaign_id == campaign_id).all()
+        print(f"Found {len(leads)} leads")
         
-        elif event_type == "email.bounced":
-            email_log.status = EmailStatus.BOUNCED
+        if not leads:
+            print("ERROR: No leads in campaign")
+            return {"error": "No leads in campaign", "sent": 0, "total": 0}
         
+        sent_count = 0
+        failed_count = 0
+        
+        for idx, lead in enumerate(leads):
+            try:
+                print(f"\n--- Sending email {idx + 1}/{len(leads)} to {lead.email} ---")
+                
+                # Replace template variables
+                body = campaign.email_template
+                body = body.replace("{first_name}", lead.first_name or "")
+                body = body.replace("{last_name}", lead.last_name or "")
+                body = body.replace("{company}", lead.company or "")
+                
+                # Convert plain text to HTML if needed
+                body = convert_text_to_html(body)
+                
+                subject = campaign.subject_line
+                subject = subject.replace("{first_name}", lead.first_name or "")
+                subject = subject.replace("{last_name}", lead.last_name or "")
+                subject = subject.replace("{company}", lead.company or "")
+                
+                print(f"Subject: {subject}")
+                print(f"To: {lead.email}")
+                print(f"From: {from_email}")
+                print("Calling Resend API...")
+                
+                response = requests.post(
+                    "https://api.resend.com/emails",
+                    headers={
+                        "Authorization": f"Bearer {RESEND_API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "from": from_email,
+                        "to": lead.email,
+                        "subject": subject,
+                        "html": body,
+                    }
+                )
+                
+                print(f"Resend response status: {response.status_code}")
+                print(f"Resend response: {response.text}")
+                
+                if response.status_code != 200:
+                    print(f"ERROR: Resend API returned {response.status_code}")
+                    failed_count += 1
+                    continue
+                
+                response_data = response.json()
+                resend_id = response_data.get("id")
+                print(f"Email sent with Resend ID: {resend_id}")
+                
+                email_id = str(uuid.uuid4())
+                email_log = EmailLog(
+                    id=email_id,
+                    campaign_id=campaign_id,
+                    lead_id=lead.id,
+                    recipient_email=lead.email,
+                    subject=subject,
+                    body=body,
+                    status=EmailStatus.SENT,
+                    sent_at=datetime.utcnow(),
+                    resend_email_id=resend_id
+                )
+                db.add(email_log)
+                sent_count += 1
+                print(f"✓ Email sent successfully")
+                
+            except Exception as e:
+                print(f"✗ ERROR sending email to {lead.email}: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                failed_count += 1
+                continue
+        
+        print(f"\nUpdating campaign stats: {sent_count} sent, {failed_count} failed")
+        campaign.emails_sent += sent_count
         db.commit()
-        return {"status": "processed"}
+        print("Campaign stats updated")
+        
+        result = {
+            "message": f"Sent {sent_count} emails",
+            "sent": sent_count,
+            "total": len(leads),
+            "failed": failed_count
+        }
+        print(f"Final result: {result}")
+        print("=== SEND EMAILS END ===\n")
+        return result
         
     except Exception as e:
-        print(f"Error handling webhook: {str(e)}")
+        print(f"FATAL ERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        print("=== SEND EMAILS END ===\n")
+        return {"error": str(e), "sent": 0, "total": 0}
+
+
+def handle_reply(email_id: str, from_email: str, to_email: str, subject: str, body: str, db: Session):
+    try:
+        email_log = db.query(EmailLog).filter(EmailLog.resend_email_id == email_id).first()
+        
+        if not email_log:
+            print(f"Email log not found for {email_id}")
+            return {"error": "Email log not found"}
+        
+        email_log.status = EmailStatus.REPLIED
+        email_log.replied_at = datetime.utcnow()
+        
+        campaign = db.query(Campaign).filter(Campaign.id == email_log.campaign_id).first()
+        if campaign:
+            campaign.replies_received += 1
+        
+        db.commit()
+        
+        return {"message": "Reply recorded", "email_id": email_id}
+        
+    except Exception as e:
+        print(f"Error handling reply: {str(e)}")
         return {"error": str(e)}

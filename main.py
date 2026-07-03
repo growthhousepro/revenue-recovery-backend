@@ -1,41 +1,45 @@
-import os
 from dotenv import load_dotenv
+import os
 
-# Load environment variables
 load_dotenv()
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from models import init_db
-from routes import auth, campaigns, webhooks
+from routes import auth, campaigns, templates, webhooks, bookings, admin, teams, followups, notifications, billing
+from scheduler import start_scheduler
 
-# Initialize database
-init_db()
+app = FastAPI()
 
-app = FastAPI(title="Revenue Recovery API", version="1.0.0")
-
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:8000", "*"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Routes
-app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
-app.include_router(campaigns.router, prefix="/api/campaigns", tags=["Campaigns"])
-app.include_router(webhooks.router, prefix="/api", tags=["Webhooks"])
+init_db()
+
+app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+app.include_router(campaigns.router, prefix="/api/campaigns", tags=["campaigns"])
+app.include_router(templates.router, prefix="/api/templates", tags=["templates"])
+app.include_router(webhooks.router, prefix="/api/webhooks", tags=["webhooks"])
+app.include_router(bookings.router, prefix="/api/bookings", tags=["bookings"])
+app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
+app.include_router(teams.router, prefix="/api/teams", tags=["teams"])
+app.include_router(followups.router, prefix="/api/followups", tags=["followups"])
+app.include_router(notifications.router, prefix="/api/notifications", tags=["notifications"])
+app.include_router(billing.router, prefix="/api/billing", tags=["billing"])
+
+scheduler = start_scheduler()
 
 @app.get("/")
 def read_root():
-    return {"message": "Revenue Recovery API", "version": "1.0.0"}
+    return {"message": "GrowthHouse API is running"}
 
-@app.get("/health")
-def health_check():
-    return {"status": "healthy"}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.on_event("shutdown")
+def shutdown_scheduler():
+    if scheduler and scheduler.running:
+        scheduler.shutdown()
+        print("[Scheduler] Background scheduler stopped")

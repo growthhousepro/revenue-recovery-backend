@@ -1,18 +1,25 @@
-from fastapi import APIRouter, HTTPException, Depends, Header
+from fastapi import APIRouter, HTTPException, Depends, Header, UploadFile, File
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
-from datetime import datetime
+from jose import jwt, JWTError
 import uuid
 import os
-from models import Campaign, Lead, EmailLog, CampaignStatus, EmailStatus, get_db, User
-from jose import jwt, JWTError
+import csv
+import io
+import requests
+
+from models import (
+    Campaign, CampaignStatus, Lead, EmailLog, EmailStatus, 
+    User, get_db
+)
 
 router = APIRouter()
 
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
 ALGORITHM = "HS256"
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+FROM_EMAIL = os.getenv("FROM_EMAIL", "noreply@example.com")
 
-# ============ HELPER ============
 def get_current_user_id(authorization: str = Header(None)):
     if not authorization:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -27,92 +34,66 @@ def get_current_user_id(authorization: str = Header(None)):
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# ============ SCHEMAS ============
-class LeadCreate(BaseModel):
-    first_name: str
-    last_name: str
-    email: str
-    company: str = None
-    title: str = None
-    phone: str = None
-
-class CampaignCreate(BaseModel):
+class CreateCampaignRequest(BaseModel):
     name: str
     client_name: str
-    description: str = None
     subject_line: str
     email_template: str
+    description: str = ""
 
-class CampaignUpdate(BaseModel):
+class UpdateCampaignRequest(BaseModel):
     name: str = None
     client_name: str = None
-    description: str = None
     subject_line: str = None
     email_template: str = None
+    description: str = None
 
-class CampaignResponse(BaseModel):
-    id: str
-    name: str
-    client_name: str
-    status: str
-    total_leads: int
-    emails_sent: int
-    replies_received: int
-    opens: int
-    created_at: datetime
-
-class DetailedCampaignResponse(CampaignResponse):
-    description: str
-    subject_line: str
-    email_template: str
-    started_at: datetime = None
-    completed_at: datetime = None
-
-# ============ ENDPOINTS ============
-
-@router.post("/", response_model=DetailedCampaignResponse)
+@router.post("/")
 def create_campaign(
-    campaign: CampaignCreate,
+    request: CreateCampaignRequest,
     db: Session = Depends(get_db),
     user_id: str = Depends(get_current_user_id)
 ):
+    """Create a new campaign"""
+    user = db.query(User).filter(User.id == user_id).first()
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    if not user.team_id:
+        raise HTTPException(status_code=400, detail="User is not part of a team")
+    
     campaign_id = str(uuid.uuid4())
     
-    db_campaign = Campaign(
+    new_campaign = Campaign(
         id=campaign_id,
+        team_id=user.team_id,
         user_id=user_id,
-        name=campaign.name,
-        client_name=campaign.client_name,
-        description=campaign.description,
-        subject_line=campaign.subject_line,
-        email_template=campaign.email_template,
+        name=request.name,
+        client_name=request.client_name,
+        subject_line=request.subject_line,
+        email_template=request.email_template,
+        description=request.description,
         status=CampaignStatus.DRAFT
     )
     
-    db.add(db_campaign)
+    db.add(new_campaign)
     db.commit()
-    db.refresh(db_campaign)
+    db.refresh(new_campaign)
     
     return {
-        "id": db_campaign.id,
-        "name": db_campaign.name,
-        "client_name": db_campaign.client_name,
-        "status": db_campaign.status.value,
-        "total_leads": db_campaign.total_leads,
-        "emails_sent": db_campaign.emails_sent,
-        "replies_received": db_campaign.replies_received,
-        "opens": db_campaign.opens,
-        "created_at": db_campaign.created_at,
-        "description": db_campaign.description,
-        "subject_line": db_campaign.subject_line,
-        "email_template": db_campaign.email_template
+        "id": new_campaign.id,
+        "name": new_campaign.name,
+        "status": new_campaign.status,
+        "created_at": new_campaign.created_at
     }
 
-@router.get("/", response_model=list)
+@router.get("/")
 def list_campaigns(
     db: Session = Depends(get_db),
     user_id: str = Depends(get_current_user_id)
 ):
+    """List all campaigns for user"""
     campaigns = db.query(Campaign).filter(Campaign.user_id == user_id).all()
     
     return [
@@ -120,22 +101,25 @@ def list_campaigns(
             "id": c.id,
             "name": c.name,
             "client_name": c.client_name,
-            "status": c.status.value,
+            "status": c.status,
             "total_leads": c.total_leads,
             "emails_sent": c.emails_sent,
             "replies_received": c.replies_received,
+            "bookings_confirmed": c.bookings_confirmed,
             "opens": c.opens,
+            "charge_booking_fee": c.charge_booking_fee,
             "created_at": c.created_at
         }
         for c in campaigns
     ]
 
-@router.get("/{campaign_id}", response_model=DetailedCampaignResponse)
+@router.get("/{campaign_id}")
 def get_campaign(
     campaign_id: str,
     db: Session = Depends(get_db),
     user_id: str = Depends(get_current_user_id)
 ):
+    """Get a specific campaign"""
     campaign = db.query(Campaign).filter(
         Campaign.id == campaign_id,
         Campaign.user_id == user_id
@@ -148,26 +132,36 @@ def get_campaign(
         "id": campaign.id,
         "name": campaign.name,
         "client_name": campaign.client_name,
-        "status": campaign.status.value,
-        "total_leads": campaign.total_leads,
-        "emails_sent": campaign.emails_sent,
-        "replies_received": campaign.replies_received,
-        "opens": campaign.opens,
-        "created_at": campaign.created_at,
         "description": campaign.description,
         "subject_line": campaign.subject_line,
         "email_template": campaign.email_template,
-        "started_at": campaign.started_at,
-        "completed_at": campaign.completed_at
+        "status": campaign.status,
+        "total_leads": campaign.total_leads,
+        "emails_sent": campaign.emails_sent,
+        "replies_received": campaign.replies_received,
+        "bookings_confirmed": campaign.bookings_confirmed,
+        "opens": campaign.opens,
+        "charge_booking_fee": campaign.charge_booking_fee,
+        "follow_up_1_enabled": campaign.follow_up_1_enabled,
+        "follow_up_1_days": campaign.follow_up_1_days,
+        "follow_up_1_template_id": campaign.follow_up_1_template_id,
+        "follow_up_2_enabled": campaign.follow_up_2_enabled,
+        "follow_up_2_days": campaign.follow_up_2_days,
+        "follow_up_2_template_id": campaign.follow_up_2_template_id,
+        "follow_up_3_enabled": campaign.follow_up_3_enabled,
+        "follow_up_3_days": campaign.follow_up_3_days,
+        "follow_up_3_template_id": campaign.follow_up_3_template_id,
+        "created_at": campaign.created_at
     }
 
-@router.put("/{campaign_id}", response_model=DetailedCampaignResponse)
+@router.put("/{campaign_id}")
 def update_campaign(
     campaign_id: str,
-    campaign_update: CampaignUpdate,
+    request: UpdateCampaignRequest,
     db: Session = Depends(get_db),
     user_id: str = Depends(get_current_user_id)
 ):
+    """Update a campaign"""
     campaign = db.query(Campaign).filter(
         Campaign.id == campaign_id,
         Campaign.user_id == user_id
@@ -176,36 +170,20 @@ def update_campaign(
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
     
-    if campaign_update.name:
-        campaign.name = campaign_update.name
-    if campaign_update.client_name:
-        campaign.client_name = campaign_update.client_name
-    if campaign_update.description:
-        campaign.description = campaign_update.description
-    if campaign_update.subject_line:
-        campaign.subject_line = campaign_update.subject_line
-    if campaign_update.email_template:
-        campaign.email_template = campaign_update.email_template
-    
-    campaign.updated_at = datetime.utcnow()
+    if request.name:
+        campaign.name = request.name
+    if request.client_name:
+        campaign.client_name = request.client_name
+    if request.subject_line:
+        campaign.subject_line = request.subject_line
+    if request.email_template:
+        campaign.email_template = request.email_template
+    if request.description is not None:
+        campaign.description = request.description
     
     db.commit()
-    db.refresh(campaign)
     
-    return {
-        "id": campaign.id,
-        "name": campaign.name,
-        "client_name": campaign.client_name,
-        "status": campaign.status.value,
-        "total_leads": campaign.total_leads,
-        "emails_sent": campaign.emails_sent,
-        "replies_received": campaign.replies_received,
-        "opens": campaign.opens,
-        "created_at": campaign.created_at,
-        "description": campaign.description,
-        "subject_line": campaign.subject_line,
-        "email_template": campaign.email_template
-    }
+    return {"message": "Campaign updated"}
 
 @router.delete("/{campaign_id}")
 def delete_campaign(
@@ -213,6 +191,7 @@ def delete_campaign(
     db: Session = Depends(get_db),
     user_id: str = Depends(get_current_user_id)
 ):
+    """Delete a campaign"""
     campaign = db.query(Campaign).filter(
         Campaign.id == campaign_id,
         Campaign.user_id == user_id
@@ -226,13 +205,14 @@ def delete_campaign(
     
     return {"message": "Campaign deleted"}
 
-@router.post("/{campaign_id}/add-leads")
-def add_leads(
+@router.post("/{campaign_id}/import-leads-csv")
+def import_leads_csv(
     campaign_id: str,
-    leads: list[LeadCreate],
+    file: UploadFile = File(...),
     db: Session = Depends(get_db),
     user_id: str = Depends(get_current_user_id)
 ):
+    """Import leads from CSV"""
     campaign = db.query(Campaign).filter(
         Campaign.id == campaign_id,
         Campaign.user_id == user_id
@@ -241,29 +221,59 @@ def add_leads(
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
     
-    added_leads = []
-    for lead_data in leads:
-        lead_id = str(uuid.uuid4())
-        db_lead = Lead(
-            id=lead_id,
-            campaign_id=campaign_id,
-            first_name=lead_data.first_name,
-            last_name=lead_data.last_name,
-            email=lead_data.email,
-            company=lead_data.company,
-            title=lead_data.title,
-            phone=lead_data.phone
-        )
-        db.add(db_lead)
-        added_leads.append(db_lead)
+    try:
+        contents = file.file.read().decode('utf-8')
+        csv_reader = csv.DictReader(io.StringIO(contents))
+        
+        if not csv_reader.fieldnames:
+            raise HTTPException(status_code=400, detail="CSV file is empty")
+        
+        if 'email' not in csv_reader.fieldnames:
+            raise HTTPException(status_code=400, detail="CSV must have 'email' column")
+        
+        added = 0
+        for row in csv_reader:
+            if not row.get('email'):
+                continue
+            
+            email = row.get('email', '').strip()
+            first_name = row.get('first_name', '').strip()
+            last_name = row.get('last_name', '').strip()
+            company = row.get('company', '').strip() if 'company' in row else None
+            
+            if not first_name and not last_name:
+                if company:
+                    first_name = company
+                    last_name = "Contact"
+                else:
+                    first_name = "Lead"
+                    last_name = "Import"
+            
+            lead = Lead(
+                id=str(uuid.uuid4()),
+                campaign_id=campaign_id,
+                first_name=first_name,
+                last_name=last_name,
+                email=email,
+                company=company,
+                title=row.get('title', '').strip() if 'title' in row else None,
+                phone=row.get('phone', '').strip() if 'phone' in row else None,
+            )
+            db.add(lead)
+            added += 1
+        
+        campaign.total_leads += added
+        db.commit()
+        
+        return {
+            "added": added,
+            "message": f"Successfully imported {added} leads"
+        }
     
-    campaign.total_leads += len(leads)
-    db.commit()
-    
-    return {
-        "message": f"Added {len(leads)} leads",
-        "total_leads": campaign.total_leads
-    }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error parsing CSV: {str(e)}")
 
 @router.post("/{campaign_id}/launch")
 def launch_campaign(
@@ -271,6 +281,7 @@ def launch_campaign(
     db: Session = Depends(get_db),
     user_id: str = Depends(get_current_user_id)
 ):
+    """Launch a campaign"""
     campaign = db.query(Campaign).filter(
         Campaign.id == campaign_id,
         Campaign.user_id == user_id
@@ -279,31 +290,18 @@ def launch_campaign(
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
     
-    if campaign.status != CampaignStatus.DRAFT:
-        raise HTTPException(status_code=400, detail="Campaign must be in DRAFT status")
-    
-    if campaign.total_leads == 0:
-        raise HTTPException(status_code=400, detail="Campaign must have leads")
-    
     campaign.status = CampaignStatus.ACTIVE
-    campaign.started_at = datetime.utcnow()
-    
     db.commit()
     
-    return {
-        "message": "Campaign launched",
-        "status": campaign.status.value,
-        "started_at": campaign.started_at
-    }
+    return {"message": "Campaign launched", "status": campaign.status}
 
 @router.post("/{campaign_id}/send-emails")
-def send_campaign_emails(
+def send_emails(
     campaign_id: str,
     db: Session = Depends(get_db),
     user_id: str = Depends(get_current_user_id)
 ):
-    from services.email_service import send_campaign_emails as send_emails
-    
+    """Send emails for a campaign"""
     campaign = db.query(Campaign).filter(
         Campaign.id == campaign_id,
         Campaign.user_id == user_id
@@ -312,80 +310,90 @@ def send_campaign_emails(
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
     
-    if campaign.total_leads == 0:
-        raise HTTPException(status_code=400, detail="Campaign has no leads")
+    leads = db.query(Lead).filter(Lead.campaign_id == campaign_id).all()
     
-    result = send_emails(campaign_id, db)
+    sent = 0
+    for lead in leads:
+        existing_email = db.query(EmailLog).filter(
+            EmailLog.campaign_id == campaign_id,
+            EmailLog.lead_id == lead.id
+        ).first()
+        
+        if existing_email:
+            continue
+        
+        user = db.query(User).filter(User.id == user_id).first()
+        from_addr = user.sender_email if user.sender_email else FROM_EMAIL
+        
+        try:
+            response = requests.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {RESEND_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "from": from_addr,
+                    "to": lead.email,
+                    "subject": campaign.subject_line,
+                    "html": campaign.email_template,
+                }
+            )
+            response_data = response.json()
+            
+            email_log = EmailLog(
+                id=str(uuid.uuid4()),
+                campaign_id=campaign_id,
+                lead_id=lead.id,
+                recipient_email=lead.email,
+                subject=campaign.subject_line,
+                body=campaign.email_template,
+                status=EmailStatus.SENT,
+                resend_email_id=response_data.get('id', '')
+            )
+            db.add(email_log)
+            sent += 1
+            print(f"✅ Sent to {lead.email}")
+        except Exception as e:
+            print(f"❌ Failed to send to {lead.email}: {e}")
     
-    return result
-
-@router.post("/{campaign_id}/pause")
-def pause_campaign(
-    campaign_id: str,
-    db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id)
-):
-    campaign = db.query(Campaign).filter(
-        Campaign.id == campaign_id,
-        Campaign.user_id == user_id
-    ).first()
-    
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-    
-    campaign.status = CampaignStatus.PAUSED
+    campaign.emails_sent += sent
     db.commit()
-    
-    return {"message": "Campaign paused", "status": campaign.status.value}
-
-@router.post("/{campaign_id}/resume")
-def resume_campaign(
-    campaign_id: str,
-    db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id)
-):
-    campaign = db.query(Campaign).filter(
-        Campaign.id == campaign_id,
-        Campaign.user_id == user_id
-    ).first()
-    
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-    
-    campaign.status = CampaignStatus.ACTIVE
-    db.commit()
-    
-    return {"message": "Campaign resumed", "status": campaign.status.value}
-
-@router.get("/{campaign_id}/analytics")
-def get_campaign_analytics(
-    campaign_id: str,
-    db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id)
-):
-    campaign = db.query(Campaign).filter(
-        Campaign.id == campaign_id,
-        Campaign.user_id == user_id
-    ).first()
-    
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-    
-    email_logs = db.query(EmailLog).filter(EmailLog.campaign_id == campaign_id).all()
-    
-    total_sent = len([e for e in email_logs if e.status in [EmailStatus.SENT, EmailStatus.OPENED, EmailStatus.REPLIED]])
-    total_opened = len([e for e in email_logs if e.status in [EmailStatus.OPENED, EmailStatus.REPLIED]])
-    total_replied = len([e for e in email_logs if e.status == EmailStatus.REPLIED])
-    
-    open_rate = (total_opened / total_sent * 100) if total_sent > 0 else 0
-    reply_rate = (total_replied / total_sent * 100) if total_sent > 0 else 0
     
     return {
-        "campaign_id": campaign_id,
-        "total_leads": campaign.total_leads,
-        "emails_sent": total_sent,
-        "opens": total_opened,
-        "replies": total_replied,
-        "open_rate": round(open_rate, 2),
-        "reply_rate": round(reply_rate, 2)
+        "sent": sent,
+        "total": len(leads),
+        "message": f"Sent {sent}/{len(leads)} emails"
     }
+
+@router.get("/{campaign_id}/email-logs")
+def get_email_logs(
+    campaign_id: str,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id)
+):
+    """Get email logs for a campaign"""
+    campaign = db.query(Campaign).filter(
+        Campaign.id == campaign_id,
+        Campaign.user_id == user_id
+    ).first()
+    
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    
+    logs = db.query(EmailLog).filter(EmailLog.campaign_id == campaign_id).all()
+    
+    return [
+        {
+            "id": log.id,
+            "lead_id": log.lead_id,
+            "recipient_email": log.recipient_email,
+            "subject": log.subject,
+            "status": log.status,
+            "sent_at": log.sent_at,
+            "opened_at": log.opened_at,
+            "replied_at": log.replied_at,
+            "reply_text": log.reply_text
+        }
+        for log in logs
+    ]
