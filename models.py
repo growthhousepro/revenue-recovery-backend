@@ -58,16 +58,6 @@ class NotificationType(str, PyEnum):
     CAMPAIGN_LAUNCHED = "campaign_launched"
     CAMPAIGN_COMPLETED = "campaign_completed"
 
-class Plan(str, PyEnum):
-    LAUNCH = "launch"
-    SCALE = "scale"
-
-class SubscriptionStatus(str, PyEnum):
-    ACTIVE = "active"
-    PAST_DUE = "past_due"
-    CANCELED = "canceled"
-    PAUSED = "paused"
-
 # ===== USERS & TEAMS =====
 
 class Team(Base):
@@ -228,57 +218,6 @@ class FollowUpEmail(Base):
     scheduled_for = Column(DateTime, nullable=False)
     sent_at = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow)
-
-# ===== BILLING =====
-
-class Subscription(Base):
-    __tablename__ = "subscriptions"
-    
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id = Column(String, ForeignKey('users.id'), nullable=False)
-    team_id = Column(String, ForeignKey('teams.id'), nullable=False)
-    plan = Column(String, nullable=False)
-    status = Column(String, default=SubscriptionStatus.ACTIVE)
-    stripe_customer_id = Column(String, unique=True, nullable=False)
-    stripe_subscription_id = Column(String, unique=True)
-    stripe_price_id = Column(String)
-    current_period_start = Column(DateTime, default=datetime.utcnow)
-    current_period_end = Column(DateTime)
-    canceled_at = Column(DateTime)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-class UsageRecord(Base):
-    __tablename__ = "usage_records"
-    
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id = Column(String, ForeignKey('users.id'), nullable=False)
-    team_id = Column(String, ForeignKey('teams.id'), nullable=False)
-    usage_type = Column(String, nullable=False)
-    quantity = Column(Integer, default=1)
-    cost = Column(Float)
-    campaign_id = Column(String, ForeignKey('campaigns.id'))
-    meta_data = Column(String)
-    billing_period_start = Column(DateTime)
-    billing_period_end = Column(DateTime)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class Payment(Base):
-    __tablename__ = "payments"
-    
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id = Column(String, ForeignKey('users.id'), nullable=False)
-    team_id = Column(String, ForeignKey('teams.id'), nullable=False)
-    stripe_invoice_id = Column(String, unique=True)
-    stripe_payment_intent_id = Column(String)
-    amount = Column(Float)
-    currency = Column(String, default="usd")
-    status = Column(String)
-    invoice_url = Column(String)
-    description = Column(String)
-    billing_reason = Column(String)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 # ===== DATABASE INITIALIZATION =====
 

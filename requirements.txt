@@ -12,4 +12,3 @@ python-dotenv
 stripe
 html2text
 httpx
-psycopg2-binary
