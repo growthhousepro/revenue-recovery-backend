@@ -7,7 +7,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from models import init_db
 from routes import auth, campaigns, templates, webhooks, bookings, admin, teams, followups, notifications, billing
-from scheduler import start_scheduler
 
 app = FastAPI()
 
@@ -32,14 +31,6 @@ app.include_router(followups.router, prefix="/api/followups", tags=["followups"]
 app.include_router(notifications.router, prefix="/api/notifications", tags=["notifications"])
 app.include_router(billing.router, prefix="/api/billing", tags=["billing"])
 
-scheduler = start_scheduler()
-
 @app.get("/")
 def read_root():
     return {"message": "GrowthHouse API is running"}
-
-@app.on_event("shutdown")
-def shutdown_scheduler():
-    if scheduler and scheduler.running:
-        scheduler.shutdown()
-        print("[Scheduler] Background scheduler stopped")
