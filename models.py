@@ -6,12 +6,11 @@ import uuid
 from enum import Enum as PyEnum
 import os
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://postgres:IcQyhOrEjjaMuZmnWwfhOTKdrMdMIoGR@postgres.railway.internal:5432/railway"
-)
+DATABASE_URL = "sqlite:///./saas.db"
 
-engine = create_engine(DATABASE_URL)
+engine = create_engine(
+    DATABASE_URL, connect_args={"check_same_thread": False}
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
